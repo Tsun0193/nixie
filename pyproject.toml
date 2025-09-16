@@ -1,0 +1,15 @@
+[project]
+name = "nixie"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=5.45.0",
+    "matplotlib>=3.10.6",
+    "paddleocr[doc-parser,ie]>=3.2.0",
+    "paddlepaddle>=3.2.0",
+    "pdf2image>=1.17.0",
+    "torch>=2.8.0",
+    "transformers>=4.56.1",
+]

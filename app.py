@@ -63,7 +63,7 @@ def extract_info(pdf_file, fields_table):
 
     try:
         resp = client.responses.create(
-            model="gpt-4o",
+            model="gpt-4.1-mini",
             input=[{"role": "user",
                     "content": [
                         {"type": "input_text", "text": sys_prompt},

@@ -1,5 +1,13 @@
 import gradio as gr
-import json, re, csv, base64
+import json
+import re
+import csv
+import base64
+import tempfile
+import os
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+import uvicorn
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -15,7 +23,7 @@ DEFAULT_FIELDS = [
     "Kho nhận", "Địa chỉ", "Mã AR"
 ]
 
-# === Helper ===
+# === Helpers ===
 def build_prompt(custom_fields):
     fields_text = "\n".join([f'    \"{f}\": ,' for f in custom_fields])
     return f"""
@@ -41,7 +49,7 @@ def clean_json_output(output: str) -> str:
 def get_fields_from_table(table):
     if table is None:
         return []
-    if hasattr(table, "values"):  # pandas DataFrame
+    if hasattr(table, "values"):
         table = table.values.tolist()
     return [row[0].strip() for row in table if row and row[0] and str(row[0]).strip()]
 
@@ -58,7 +66,8 @@ def extract_info(pdf_file, fields_table):
     last_fields = fields_list
     sys_prompt = build_prompt(fields_list)
 
-    uploaded_file = client.files.create(file=open(pdf_file.name, "rb"), purpose="assistants")
+    path = pdf_file.name if hasattr(pdf_file, "name") else pdf_file
+    uploaded_file = client.files.create(file=open(path, "rb"), purpose="assistants")
     file_id = uploaded_file.id
 
     try:
@@ -80,7 +89,7 @@ def extract_info(pdf_file, fields_table):
         if isinstance(data, dict):
             data = [data]
         if not data:
-            return [], "⚠️ No entries extracted"
+            return [], "⚠️ No entries extracted."
 
         rows = [[str(entry.get(h, "")) for h in fields_list] for entry in data]
         table_data = rows
@@ -107,32 +116,33 @@ def add_to_results(table):
         )
     return "⚠️ Nothing to add", gr.update(value=[], headers=["Field1"], col_count=(1,"dynamic"))
 
-def download_json():
-    if not session_results: return None
-    path = "extracted_results.json"
-    with open(path, "w", encoding="utf-8") as f:
+# === File writers ===
+def write_results_files():
+    if not session_results:
+        return None, None
+    json_path = os.path.join(tempfile.gettempdir(), "results.json")
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(session_results, f, ensure_ascii=False, indent=2)
-    return path
 
-def download_csv():
-    if not session_results: return None
-    path = "extracted_results.csv"
+    csv_path = os.path.join(tempfile.gettempdir(), "results.csv")
     headers = session_results[0].keys()
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader(); writer.writerows(session_results)
-    return path
+        writer.writeheader()
+        writer.writerows(session_results)
+    return json_path, csv_path
 
 def clear_results():
     global session_results, table_data
     session_results, table_data = [], []
     return [], "Cleared all results.", gr.update(value=[], headers=["Field1"], col_count=(1,"dynamic"))
 
-# === PDF Preview (base64 embed, A4 ratio) ===
+# === PDF Preview ===
 def show_pdf(file):
     if file is None:
         return ""
-    with open(file.name, "rb") as f:
+    path = file.name if hasattr(file, "name") else file
+    with open(path, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode("utf-8")
     width = 700
@@ -144,11 +154,10 @@ def show_pdf(file):
            style="border:1px solid #ddd; margin:auto; display:block;" />
     '''
 
-# === UI ===
+# === Gradio UI ===
 with gr.Blocks() as demo:
     gr.Markdown("## 🧾 Multi-entry PDF Information Extraction")
 
-    # Row 1: Upload (trái) + Fields (phải)
     with gr.Row():
         with gr.Column(scale=2):
             pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"])
@@ -167,6 +176,21 @@ with gr.Blocks() as demo:
 
     pdf_file.upload(show_pdf, inputs=pdf_file, outputs=pdf_preview)
 
+    gr.Examples(
+        examples=[
+            ["data/DN2305.015_sample.pdf"],
+            ["data/new_format_1.pdf"],
+            ["data/new_format_3.pdf"],
+            ["data/new_format_5.pdf"]
+        ],
+        fn=show_pdf,
+        inputs=[pdf_file],
+        outputs=[pdf_preview],
+        cache_examples=False,
+        label="Try with example PDFs",
+        preload=True
+    )
+
     extract_btn = gr.Button("Extract Info")
     status = gr.Label()
 
@@ -181,7 +205,6 @@ with gr.Blocks() as demo:
 
     add_results_btn = gr.Button("Add to Results")
 
-    # Bảng accumulated (dummy header để init)
     session_table = gr.Dataframe(
         headers=["Field1"],
         datatype="str",
@@ -192,22 +215,40 @@ with gr.Blocks() as demo:
     )
 
     with gr.Row():
-        download_json_btn = gr.Button("Download JSON")
-        download_csv_btn = gr.Button("Download CSV")
+        # Interactive download buttons (open FastAPI routes in new tab)
+        download_json_btn = gr.Button("⬇️ Download JSON")
+        download_csv_btn = gr.Button("⬇️ Download CSV")
         clear_btn = gr.Button("Clear Session")
 
-    download_json_file = gr.File(label="Download JSON", interactive=False)
-    download_csv_file = gr.File(label="Download CSV", interactive=False)
+        download_json_btn.click(None, js="() => { window.open('/download/json', '_blank') }")
+        download_csv_btn.click(None, js="() => { window.open('/download/csv', '_blank') }")
 
-    # Wiring
     extract_btn.click(extract_info, inputs=[pdf_file, fields_table],
                       outputs=[demo_table, status])
     add_results_btn.click(add_to_results, inputs=[demo_table],
                           outputs=[status, session_table])
-    download_json_btn.click(download_json, outputs=[download_json_file])
-    download_csv_btn.click(download_csv, outputs=[download_csv_file])
     clear_btn.click(clear_results,
                     outputs=[demo_table, status, session_table])
 
+# === FastAPI integration ===
+app = FastAPI()
+
+@app.get("/download/json")
+def download_json_api():
+    json_path, _ = write_results_files()
+    if not json_path:
+        return {"error": "No results to download"}
+    return FileResponse(json_path, filename="results.json", media_type="application/json")
+
+@app.get("/download/csv")
+def download_csv_api():
+    _, csv_path = write_results_files()
+    if not csv_path:
+        return {"error": "No results to download"}
+    return FileResponse(csv_path, filename="results.csv", media_type="text/csv")
+
+# Mount Gradio after endpoints
+app = gr.mount_gradio_app(app, demo, path="/")
+
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    uvicorn.run("demo:app", host="0.0.0.0", port=7860, reload=True)

@@ -1430,7 +1430,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "gradio", specifier = ">=5.45.0" },
+    { name = "gradio", extras = ["client"], specifier = ">=5.45.0" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "paddleocr", extras = ["doc-parser", "ie"], specifier = ">=3.2.0" },
     { name = "paddlepaddle", specifier = ">=3.2.0" },

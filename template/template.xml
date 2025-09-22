@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Declaration>
+    <GeneralInfo>
+        <SoToKhai>{SoToKhai}</SoToKhai>
+        <NgayKhaiBao>{NgayKhaiBao}</NgayKhaiBao>
+        <LoaiHinh>{LoaiHinh}</LoaiHinh>
+        <HaiQuan>{HaiQuan}</HaiQuan>
+    </GeneralInfo>
+
+    <Exporter>
+        <Name>{ExporterName}</Name>
+        <Address>{ExporterAddress}</Address>
+        <CountryCode>{ExporterCountryCode}</CountryCode>
+    </Exporter>
+
+    <Importer>
+        <Name>{ImporterName}</Name>
+        <Address>{ImporterAddress}</Address>
+        <TaxCode>{ImporterTaxCode}</TaxCode>
+    </Importer>
+
+    <Transport>
+        <PhuongTien>{PhuongTien}</PhuongTien>
+        <BillOfLading>{BillOfLading}</BillOfLading>
+        <PortOfEntry>{PortOfEntry}</PortOfEntry>
+    </Transport>
+
+    <GoodsList>
+        {GoodsList}
+    </GoodsList>
+
+    <Taxes>
+        <ImportDuty>{ImportDuty}</ImportDuty>
+        <VAT>{VAT}</VAT>
+        <TotalTax>{TotalTax}</TotalTax>
+    </Taxes>
+</Declaration>

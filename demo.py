@@ -1,13 +1,14 @@
 import gradio as gr
 import json
-import re
 import csv
+import yaml
 import base64
 import tempfile
 import os
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 import uvicorn
+from utils.helpers import build_prompt, clean_json_output, get_fields_from_table
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -17,43 +18,15 @@ client = OpenAI()
 # Session
 session_results, last_fields, table_data = [], None, []
 
-DEFAULT_FIELDS = [
-    "Số phiếu", "Ngày chứng từ(mm/dd/yyyy)", "Ngày xuất(mm/dd/yyyy)",
-    "Mã FG", "Đvt", "Số lượng(Thùng)", "Số lượng(Pcs)",
-    "Kho nhận", "Địa chỉ", "Mã AR"
-]
+# === Config ===
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+with open("template/template.xml", "r", encoding="utf-8") as f:
+    template_xml = f.read()
 
-# === Helpers ===
-def build_prompt(custom_fields):
-    fields_text = "\n".join([f'    \"{f}\": ,' for f in custom_fields])
-    return f"""
-Bạn là công cụ trích xuất thông tin từ file PDF (hóa đơn/biên lai/chứng từ).
-Nhiệm vụ:
-- Đọc toàn bộ nội dung PDF
-- Sửa lỗi OCR (dấu tiếng Việt, chính tả)
-- Ánh xạ dữ liệu vào danh sách JSON, mỗi phần tử là một entry (có thể nhiều entry).
-[
-{{
-{fields_text}
-}} ,
-...
-]
-Chỉ trả về JSON hợp lệ, không thêm giải thích.
-"""
+DEFAULT_FIELDS = config.get("DEFAULT_FIELDS", ["Field1", "Field2", "Field3"])
 
-def clean_json_output(output: str) -> str:
-    output = re.sub(r"^```[a-zA-Z]*\n?", "", output.strip())
-    output = re.sub(r"\n?```$", "", output.strip())
-    return output.strip()
-
-def get_fields_from_table(table):
-    if table is None:
-        return []
-    if hasattr(table, "values"):
-        table = table.values.tolist()
-    return [row[0].strip() for row in table if row and row[0] and str(row[0]).strip()]
-
-# === Core ===
+# === Core Extraction ===
 def extract_info(pdf_file, fields_table):
     global last_fields, table_data
     if pdf_file is None:
@@ -131,6 +104,60 @@ def write_results_files():
         writer.writeheader()
         writer.writerows(session_results)
     return json_path, csv_path
+
+def write_xml_results(template_xml: str):
+    if not session_results:
+        return None
+
+    # Build goods items block
+    goods_items = []
+    for entry in session_results:
+        goods_items.append(f"""
+        <Item>
+            <Description>{entry.get("Description","")}</Description>
+            <HSCode>{entry.get("HSCode","")}</HSCode>
+            <OriginCountry>{entry.get("OriginCountry","")}</OriginCountry>
+            <Quantity>{entry.get("Quantity","")}</Quantity>
+            <Unit>{entry.get("Unit","")}</Unit>
+            <CIFValue>{entry.get("CIFValue","")}</CIFValue>
+            <Currency>{entry.get("Currency","")}</Currency>
+        </Item>
+        """)
+    goods_block = "\n".join(goods_items)
+
+    # Use the first row for "header-level" fields (GeneralInfo, Exporter, Importer, Transport, Taxes)
+    first = session_results[0]
+
+    xml_filled = template_xml.format(
+        SoToKhai=first.get("SoToKhai", ""),
+        NgayKhaiBao=first.get("NgayKhaiBao", ""),
+        LoaiHinh=first.get("LoaiHinh", ""),
+        HaiQuan=first.get("HaiQuan", ""),
+
+        ExporterName=first.get("ExporterName", ""),
+        ExporterAddress=first.get("ExporterAddress", ""),
+        ExporterCountryCode=first.get("ExporterCountryCode", ""),
+
+        ImporterName=first.get("ImporterName", ""),
+        ImporterAddress=first.get("ImporterAddress", ""),
+        ImporterTaxCode=first.get("ImporterTaxCode", ""),
+
+        PhuongTien=first.get("PhuongTien", ""),
+        BillOfLading=first.get("BillOfLading", ""),
+        PortOfEntry=first.get("PortOfEntry", ""),
+
+        GoodsList=goods_block,
+
+        ImportDuty=first.get("ImportDuty", ""),
+        VAT=first.get("VAT", ""),
+        TotalTax=first.get("TotalTax", "")
+    )
+
+    xml_path = os.path.join(tempfile.gettempdir(), "results.xml")
+    with open(xml_path, "w", encoding="utf-8") as f:
+        f.write(xml_filled)
+
+    return xml_path
 
 def clear_results():
     global session_results, table_data
@@ -215,13 +242,14 @@ with gr.Blocks() as demo:
     )
 
     with gr.Row():
-        # Interactive download buttons (open FastAPI routes in new tab)
         download_json_btn = gr.Button("⬇️ Download JSON")
         download_csv_btn = gr.Button("⬇️ Download CSV")
+        download_xml_btn = gr.Button("⬇️ Download XML")
         clear_btn = gr.Button("Clear Session")
 
         download_json_btn.click(None, js="() => { window.open('/download/json', '_blank') }")
         download_csv_btn.click(None, js="() => { window.open('/download/csv', '_blank') }")
+        download_xml_btn.click(None, js="() => { window.open('/download/xml', '_blank') }")
 
     extract_btn.click(extract_info, inputs=[pdf_file, fields_table],
                       outputs=[demo_table, status])
@@ -246,6 +274,13 @@ def download_csv_api():
     if not csv_path:
         return {"error": "No results to download"}
     return FileResponse(csv_path, filename="results.csv", media_type="text/csv")
+
+@app.get("/download/xml")
+def download_xml_api():
+    xml_path = write_xml_results(template_xml)
+    if not xml_path:
+        return {"error": "No results to download"}
+    return FileResponse(xml_path, filename="results.xml", media_type="application/xml")
 
 # Mount Gradio after endpoints
 app = gr.mount_gradio_app(app, demo, path="/")

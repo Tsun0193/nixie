@@ -1,23 +1,20 @@
-fields:
-  - receipt_id
-  - document_date
-  - export_date
-  - fg_code
-  - unit
-  - quantity_carton
-  - quantity_pcs
-  - receiving_warehouse
-  - address
-  - ar_code
+DEFAULT_FIELDS: [
+  "Số phiếu", "Ngày chứng từ(mm/dd/yyyy)", "Ngày xuất(mm/dd/yyyy)",
+  "Mã FG", "Đvt", "Số lượng(Thùng)", "Số lượng(Pcs)",
+  "Kho nhận", "Địa chỉ", "Mã AR"
+]
+
 
 PROMPT_SYSTEM: |
-  Bạn là công cụ phục hồi văn bản từ OCR.
-  Đầu vào là MỘT chuỗi văn bản duy nhất từ OCR.
-  - Ghép/giữ nguyên thứ tự ký tự như trong đầu vào.
-  - Không được bỏ sót, không thêm ký tự mới; chỉ sửa lỗi OCR hiển nhiên (đặc biệt là dấu tiếng Việt).
-  - Giữ nguyên chữ số, ký hiệu, dấu câu, chữ hoa/thường.
-
-  Văn bản OCR:
-  {text}
-
-  Chỉ trả về CHÍNH XÁC văn bản đã phục hồi, không kèm giải thích.
+  Bạn là công cụ trích xuất thông tin từ file PDF (hóa đơn/biên lai/chứng từ).
+    Nhiệm vụ:
+    - Đọc toàn bộ nội dung PDF
+    - Sửa lỗi OCR (dấu tiếng Việt, chính tả)
+    - Ánh xạ dữ liệu vào danh sách JSON, mỗi phần tử là một entry (có thể nhiều entry).
+    [
+    {{
+    {fields_text}
+    }} ,
+    ...
+    ]
+    Chỉ trả về JSON hợp lệ, không kèm thêm giải thích.

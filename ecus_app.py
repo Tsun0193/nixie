@@ -1,58 +1,107 @@
+# ecus_app.py
+import os
+import json
+import csv
+import base64
+import tempfile
+from typing import List, Dict, Tuple
+
+import gradio as gr
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
-from app.ui.ecus import build_ecus_ui
-from app.services.files import write_csv, write_text
-import gradio as gr
-import os, csv, tempfile
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# ======= In-memory state =======
-ECUS_HEADER = {  # single declaration header
-    "SoToKhai": "", "NgayKhaiBao": "", "LoaiHinh": "", "HaiQuan": "",
-    "ExporterName": "", "ExporterAddress": "", "ExporterCountryCode": "",
-    "ImporterName": "", "ImporterAddress": "", "ImporterTaxCode": "",
-    "PhuongTien": "", "BillOfLading": "", "PortOfEntry": "",
-    "ImportDuty": "", "VAT": "", "TotalTax": "",
-}
-ECUS_GOODS = []  # list[dict] of item rows
+from utils.helpers import clean_json_output  # reuse your helper
 
-GOODS_FIELDS = ["Description", "HSCode", "OriginCountry", "Quantity", "Unit", "CIFValue", "Currency"]
+# --- env / client ---
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
+client = OpenAI(api_key=OPENAI_API_KEY)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# ======= Template =======
-TEMPLATE_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<Declaration>
-    <GeneralInfo>
-        <SoToKhai>{SoToKhai}</SoToKhai>
-        <NgayKhaiBao>{NgayKhaiBao}</NgayKhaiBao>
-        <LoaiHinh>{LoaiHinh}</LoaiHinh>
-        <HaiQuan>{HaiQuan}</HaiQuan>
-    </GeneralInfo>
-    <Exporter>
-        <Name>{ExporterName}</Name>
-        <Address>{ExporterAddress}</Address>
-        <CountryCode>{ExporterCountryCode}</CountryCode>
-    </Exporter>
-    <Importer>
-        <Name>{ImporterName}</Name>
-        <Address>{ImporterAddress}</Address>
-        <TaxCode>{ImporterTaxCode}</TaxCode>
-    </Importer>
-    <Transport>
-        <PhuongTien>{PhuongTien}</PhuongTien>
-        <BillOfLading>{BillOfLading}</BillOfLading>
-        <PortOfEntry>{PortOfEntry}</PortOfEntry>
-    </Transport>
-    <GoodsList>
-{GoodsList}
-    </GoodsList>
-    <Taxes>
-        <ImportDuty>{ImportDuty}</ImportDuty>
-        <VAT>{VAT}</VAT>
-        <TotalTax>{TotalTax}</TotalTax>
-    </Taxes>
-</Declaration>
-"""
+# --- fields ---
+ECUS_HEADER_FIELDS: List[str] = [
+    "SoToKhai","NgayKhaiBao","LoaiHinh","HaiQuan",
+    "ExporterName","ExporterAddress","ExporterCountryCode",
+    "ImporterName","ImporterAddress","ImporterTaxCode",
+    "PhuongTien","BillOfLading","PortOfEntry",
+    "ImportDuty","VAT","TotalTax",
+]
+GOODS_FIELDS: List[str] = ["Description","HSCode","OriginCountry","Quantity","Unit","CIFValue","Currency"]
 
-def build_goods_items(rows):
+# --- template ---
+with open("template/template.xml", "r", encoding="utf-8") as f:
+    TEMPLATE_XML = f.read()
+
+# --- in-memory state ---
+ECUS_HEADER: Dict[str, str] = {k: "" for k in ECUS_HEADER_FIELDS}
+ECUS_GOODS: List[Dict[str, str]] = []
+
+# --- helpers ---
+def show_pdf(file) -> str:
+    if file is None:
+        return ""
+    path = file.name if hasattr(file, "name") else file
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("utf-8")
+    width = 700
+    height = int(width * 1.414)
+    return f'''
+    <embed src="data:application/pdf;base64,{b64}"
+           type="application/pdf"
+           width="{width}px" height="{height}px"
+           style="border:1px solid #ddd; margin:auto; display:block;" />
+    '''
+
+def build_prompt(header_keys: List[str], goods_keys: List[str]) -> str:
+    return (
+        "Bạn là công cụ trích xuất thông tin từ PDF tờ khai/biên lai.\n"
+        "Đầu vào là 1 file PDF. Nhiệm vụ:\n"
+        "1) Sửa lỗi OCR hiển nhiên (dấu tiếng Việt), giữ nguyên số/ký hiệu.\n"
+        "2) Chuẩn hóa ngày (yyyy-mm-dd hoặc mm/dd/yyyy nếu chắc chắn).\n"
+        "3) Trả về JSON **hợp lệ** đúng cấu trúc sau (không giải thích thêm):\n\n"
+        "{\n"
+        '  "header": {\n' + "".join([f'    "{k}": "",\n' for k in header_keys])[:-2] + "\n  },\n"
+        '  "goods": [\n'
+        "    {\n" + "".join([f'      "{k}": "",\n' for k in goods_keys])[:-2] + "\n    }\n"
+        "  ]\n"
+        "}\n\n- Nếu không có hàng hóa, goods=[]."
+    )
+
+def extract_from_pdf(pdf_path: str) -> Tuple[Dict[str, str], List[Dict[str, str]]]:
+    prompt = build_prompt(ECUS_HEADER_FIELDS, GOODS_FIELDS)
+    uploaded = client.files.create(file=open(pdf_path, "rb"), purpose="assistants")
+    fid = uploaded.id
+    try:
+        resp = client.responses.create(
+            model=MODEL,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_file", "file_id": fid}
+                ]
+            }]
+        )
+        raw = resp.output_text.strip()
+        data = json.loads(clean_json_output(raw))
+        if not isinstance(data, dict):
+            raise ValueError("Model did not return an object")
+
+        header = {k: str(data.get("header", {}).get(k, "")) for k in ECUS_HEADER_FIELDS}
+        goods = [
+            {k: str(row.get(k, "")) for k in GOODS_FIELDS}
+            for row in (data.get("goods") or []) if isinstance(row, dict)
+        ]
+        return header, goods
+    finally:
+        client.files.delete(fid)
+
+def build_goods_items(rows: List[Dict[str, str]]) -> str:
     chunks = []
     for r in rows:
         chunks.append(f"""        <Item>
@@ -64,174 +113,221 @@ def build_goods_items(rows):
             <CIFValue>{r.get('CIFValue','')}</CIFValue>
             <Currency>{r.get('Currency','')}</Currency>
         </Item>""")
-    return "\n".join(chunks) if chunks else ""
+    return "\n".join(chunks)
 
-def fill_template(header, goods_rows):
+def fill_template(header: Dict[str, str], goods_rows: List[Dict[str, str]]) -> str:
     mapping = {**header, "GoodsList": build_goods_items(goods_rows)}
     return TEMPLATE_XML.format(**mapping)
 
-def write_file(text: str, name: str):
+def write_text_file(text: str, name: str) -> str:
     path = os.path.join(tempfile.gettempdir(), name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path
 
-def write_csv(header: dict, goods_rows: list[dict]):
-    if not goods_rows:
-        raise ValueError("No goods rows")
-    out_rows = []
-    for g in goods_rows:
-        row = {**header, **g}  # header repeated per item
-        out_rows.append(row)
-    # stable header order: header keys first, then goods fields
+def write_csv_file(header: Dict[str, str], goods_rows: List[Dict[str, str]]) -> str:
+    rows = [{**header, **g} for g in goods_rows]
     headers = list(header.keys()) + GOODS_FIELDS
     path = os.path.join(tempfile.gettempdir(), "declaration.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader(); w.writerows(out_rows)
+        w.writeheader()
+        w.writerows(rows)
     return path
 
-# ======= Gradio UI (Header form + Goods table) =======
+# ---------------------------
+# FastAPI app + download APIs
+# ---------------------------
+app = FastAPI(title="ECUS App")
+
+@app.get("/download/xml")
+def download_xml():
+    if not ECUS_GOODS:
+        return {"error": "No goods rows"}
+    xml_text = fill_template(ECUS_HEADER, ECUS_GOODS)
+    path = write_text_file(xml_text, "declaration.xml")
+    # Define filename -> Starlette sets Content-Disposition: attachment
+    return FileResponse(
+        path,
+        filename="declaration.xml",
+        media_type="application/octet-stream",  # prevent inline pretty-print
+        headers={"Content-Disposition": 'attachment; filename="declaration.xml"'}
+    )
+
+@app.get("/download/csv")
+def download_csv():
+    if not ECUS_GOODS:
+        return {"error": "No goods rows"}
+    path = write_csv_file(ECUS_HEADER, ECUS_GOODS)
+    return FileResponse(
+        path,
+        filename="declaration.csv",
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="declaration.csv"'}
+    )
+
+# ---------------------------
+# Gradio UI (mounted after routes)
+# ---------------------------
 def build_ecus_ui():
     with gr.Blocks() as demo:
-        gr.Markdown("## 📦 ECUS Declaration — One Declaration, Multiple Goods")
+        gr.Markdown("## 📦 ECUS Declaration — PDF → Header + Goods → XML/CSV")
+
+        # Upload + preview
+        with gr.Row():
+            pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"])
+            pdf_preview = gr.HTML()
+        pdf_file.upload(show_pdf, inputs=pdf_file, outputs=pdf_preview)
+
+        status = gr.Label()
 
         with gr.Tabs():
+            # ===== Header tab =====
             with gr.Tab("Declaration Header"):
-                gr.Markdown("### General Info")
+                gr.Markdown("### General")
                 with gr.Row():
-                    SoToKhai = gr.Textbox(label="Số tờ khai (SoToKhai)", value=ECUS_HEADER["SoToKhai"])
-                    NgayKhaiBao = gr.Textbox(label="Ngày khai báo (NgayKhaiBao)", value=ECUS_HEADER["NgayKhaiBao"])
-                    LoaiHinh = gr.Textbox(label="Loại hình (LoaiHinh)", value=ECUS_HEADER["LoaiHinh"])
-                    HaiQuan = gr.Textbox(label="Hải quan (HaiQuan)", value=ECUS_HEADER["HaiQuan"])
+                    SoToKhai    = gr.Textbox(label="SoToKhai")
+                    NgayKhaiBao = gr.Textbox(label="NgayKhaiBao")
+                    LoaiHinh    = gr.Textbox(label="LoaiHinh")
+                    HaiQuan     = gr.Textbox(label="HaiQuan")
 
                 gr.Markdown("### Exporter")
                 with gr.Row():
-                    ExporterName = gr.Textbox(label="Name", value=ECUS_HEADER["ExporterName"])
-                    ExporterCountryCode = gr.Textbox(label="CountryCode", value=ECUS_HEADER["ExporterCountryCode"])
-                ExporterAddress = gr.Textbox(label="Address", value=ECUS_HEADER["ExporterAddress"])
+                    ExporterName        = gr.Textbox(label="ExporterName")
+                    ExporterCountryCode = gr.Textbox(label="ExporterCountryCode")
+                ExporterAddress = gr.Textbox(label="ExporterAddress")
 
                 gr.Markdown("### Importer")
                 with gr.Row():
-                    ImporterName = gr.Textbox(label="Name", value=ECUS_HEADER["ImporterName"])
-                    ImporterTaxCode = gr.Textbox(label="TaxCode", value=ECUS_HEADER["ImporterTaxCode"])
-                ImporterAddress = gr.Textbox(label="Address", value=ECUS_HEADER["ImporterAddress"])
+                    ImporterName    = gr.Textbox(label="ImporterName")
+                    ImporterTaxCode = gr.Textbox(label="ImporterTaxCode")
+                ImporterAddress = gr.Textbox(label="ImporterAddress")
 
                 gr.Markdown("### Transport")
                 with gr.Row():
-                    PhuongTien = gr.Textbox(label="Phương tiện (PhuongTien)", value=ECUS_HEADER["PhuongTien"])
-                    BillOfLading = gr.Textbox(label="BillOfLading", value=ECUS_HEADER["BillOfLading"])
-                    PortOfEntry = gr.Textbox(label="PortOfEntry", value=ECUS_HEADER["PortOfEntry"])
+                    PhuongTien   = gr.Textbox(label="PhuongTien")
+                    BillOfLading = gr.Textbox(label="BillOfLading")
+                    PortOfEntry  = gr.Textbox(label="PortOfEntry")
 
                 gr.Markdown("### Taxes")
                 with gr.Row():
-                    ImportDuty = gr.Textbox(label="ImportDuty", value=ECUS_HEADER["ImportDuty"])
-                    VAT = gr.Textbox(label="VAT", value=ECUS_HEADER["VAT"])
-                    TotalTax = gr.Textbox(label="TotalTax", value=ECUS_HEADER["TotalTax"])
-
-                status_header = gr.Label()
+                    ImportDuty = gr.Textbox(label="ImportDuty")
+                    VAT        = gr.Textbox(label="VAT")
+                    TotalTax   = gr.Textbox(label="TotalTax")
 
                 def save_header(*vals):
-                    keys = list(ECUS_HEADER.keys())
-                    new_vals = {
-                        "SoToKhai": vals[0], "NgayKhaiBao": vals[1], "LoaiHinh": vals[2], "HaiQuan": vals[3],
-                        "ExporterName": vals[4], "ExporterAddress": vals[6], "ExporterCountryCode": vals[5],
-                        "ImporterName": vals[7], "ImporterAddress": vals[9], "ImporterTaxCode": vals[8],
-                        "PhuongTien": vals[10], "BillOfLading": vals[11], "PortOfEntry": vals[12],
-                        "ImportDuty": vals[13], "VAT": vals[14], "TotalTax": vals[15],
-                    }
-                    ECUS_HEADER.update(new_vals)
+                    keys = [
+                        "SoToKhai","NgayKhaiBao","LoaiHinh","HaiQuan",
+                        "ExporterName","ExporterAddress","ExporterCountryCode",
+                        "ImporterName","ImporterAddress","ImporterTaxCode",
+                        "PhuongTien","BillOfLading","PortOfEntry",
+                        "ImportDuty","VAT","TotalTax"
+                    ]
+                    for k, v in zip(keys, vals):
+                        ECUS_HEADER[k] = v or ""
                     return "✅ Header saved"
 
                 gr.Button("💾 Save Header").click(
                     save_header,
                     inputs=[
                         SoToKhai, NgayKhaiBao, LoaiHinh, HaiQuan,
-                        ExporterName, ExporterCountryCode, ExporterAddress,
-                        ImporterName, ImporterTaxCode, ImporterAddress,
+                        ExporterName, ExporterAddress, ExporterCountryCode,
+                        ImporterName, ImporterAddress, ImporterTaxCode,
                         PhuongTien, BillOfLading, PortOfEntry,
                         ImportDuty, VAT, TotalTax
                     ],
-                    outputs=[status_header]
+                    outputs=[status]
                 )
 
+            # ===== Goods tab =====
             with gr.Tab("Goods Items"):
-                gr.Markdown("### Goods (add/edit rows below)")
                 goods_table = gr.Dataframe(
-                    headers=GOODS_FIELDS,
-                    datatype="str",
-                    row_count=(1, "dynamic"),
-                    col_count=(len(GOODS_FIELDS), "dynamic"),
-                    interactive=True,
-                    label="Goods Table (Description, HSCode, OriginCountry, Quantity, Unit, CIFValue, Currency)"
+                    headers=GOODS_FIELDS, datatype="str",
+                    row_count=(1, "dynamic"), col_count=(len(GOODS_FIELDS), "dynamic"),
+                    interactive=True, label="Goods Table"
                 )
-                status_goods = gr.Label()
+                goods_status = gr.Label()
 
                 def add_goods(tbl):
                     if not tbl:
                         return "⚠️ Nothing to add"
                     headers = tbl.headers if hasattr(tbl, "headers") else GOODS_FIELDS
-                    values = tbl.values.tolist() if hasattr(tbl, "values") else tbl
+                    rows = tbl.values.tolist() if hasattr(tbl, "values") else tbl
                     added = 0
-                    for row in values:
-                        if any(str(x).strip() for x in row):
-                            ECUS_GOODS.append(dict(zip(headers, row))); added += 1
-                    return f"✅ Added {added} goods rows (total {len(ECUS_GOODS)})"
+                    for r in rows:
+                        if any(str(x).strip() for x in r):
+                            ECUS_GOODS.append(dict(zip(headers, r)))
+                            added += 1
+                    return f"✅ Added {added} rows (total {len(ECUS_GOODS)})"
 
                 def clear_goods():
                     ECUS_GOODS.clear()
                     return "Cleared goods."
 
                 with gr.Row():
-                    gr.Button("➕ Add to Goods").click(add_goods, inputs=[goods_table], outputs=[status_goods])
-                    gr.Button("🧹 Clear Goods").click(clear_goods, outputs=[status_goods])
+                    gr.Button("➕ Add to Goods").click(add_goods, inputs=[goods_table], outputs=[goods_status])
+                    gr.Button("🧹 Clear Goods").click(clear_goods, outputs=[goods_status])
 
-            with gr.Tab("Export"):
-                gr.Markdown("### Export Files")
-                export_status = gr.Label()
+            # ===== Extract & Download tab =====
+            with gr.Tab("Extract & Download"):
+                def do_extract(file):
+                    if file is None:
+                        empty_headers = [""] * len(ECUS_HEADER_FIELDS)
+                        table_clear = gr.update(value=[], headers=GOODS_FIELDS,
+                                                col_count=(len(GOODS_FIELDS), "dynamic"))
+                        return ("⚠️ No file", *empty_headers, table_clear)
 
-                def _export_xml():
-                    if not ECUS_GOODS:
-                        return "⚠️ No goods rows"
-                    xml_text = fill_template(ECUS_HEADER, ECUS_GOODS)
-                    path = write_file(xml_text, "declaration.xml")
-                    # open in new tab via frontend button (below)
-                    return "✅ XML ready"
+                    path = file.name if hasattr(file, "name") else file
+                    header, goods = extract_from_pdf(path)
 
-                def _export_csv():
-                    if not ECUS_GOODS:
-                        return "⚠️ No goods rows"
-                    write_csv(ECUS_HEADER, ECUS_GOODS)
-                    return "✅ CSV ready"
+                    # Save state
+                    ECUS_HEADER.update(header)
+                    ECUS_GOODS.clear()
+                    ECUS_GOODS.extend(goods)
 
-                with gr.Row():
-                    gr.Button("📄 Build XML").click(_export_xml, outputs=[export_status])
-                    gr.Button("🧾 Build CSV").click(_export_csv, outputs=[export_status])
+                    # Map header to outputs (keep order consistent with Save Header inputs)
+                    header_vals = [
+                        ECUS_HEADER["SoToKhai"], ECUS_HEADER["NgayKhaiBao"],
+                        ECUS_HEADER["LoaiHinh"], ECUS_HEADER["HaiQuan"],
+                        ECUS_HEADER["ExporterName"], ECUS_HEADER["ExporterAddress"], ECUS_HEADER["ExporterCountryCode"],
+                        ECUS_HEADER["ImporterName"], ECUS_HEADER["ImporterAddress"], ECUS_HEADER["ImporterTaxCode"],
+                        ECUS_HEADER["PhuongTien"], ECUS_HEADER["BillOfLading"], ECUS_HEADER["PortOfEntry"],
+                        ECUS_HEADER["ImportDuty"], ECUS_HEADER["VAT"], ECUS_HEADER["TotalTax"],
+                    ]
+                    goods_rows = [[g.get(h, "") for h in GOODS_FIELDS] for g in goods]
+                    goods_update = gr.update(value=goods_rows, headers=GOODS_FIELDS,
+                                             col_count=(len(GOODS_FIELDS), "dynamic"))
+                    return ("✅ Extracted", *header_vals, goods_update)
 
-                gr.Markdown(
-                    "After building files:\n\n"
-                    "- **Download XML:** open `/download/xml`\n"
-                    "- **Download CSV:** open `/download/csv`"
+                extract_btn = gr.Button("🧠 Extract from PDF")
+                extract_btn.click(
+                    do_extract,
+                    inputs=[pdf_file],
+                    outputs=[
+                        status,
+                        # 16 header textboxes in this exact order:
+                        SoToKhai, NgayKhaiBao, LoaiHinh, HaiQuan,
+                        ExporterName, ExporterAddress, ExporterCountryCode,
+                        ImporterName, ImporterAddress, ImporterTaxCode,
+                        PhuongTien, BillOfLading, PortOfEntry,
+                        ImportDuty, VAT, TotalTax,
+                        # goods table
+                        goods_table
+                    ]
                 )
 
-    return demo
+                gr.Markdown("### Download files")
+                with gr.Row():
+                    gr.Button("⬇️ Download XML").click(None, js="() => { window.open('/download/xml', '_blank') }")
+                    gr.Button("⬇️ Download CSV").click(None, js="() => { window.open('/download/csv', '_blank') }")
 
-# ======= FastAPI app (ECUS) =======
-app = FastAPI(title="ECUS App (Header + Goods)")
-ecus_ui = build_ecus_ui()
-app = gr.mount_gradio_app(app, build_ecus_ui(), path="/ecus")
+                gr.Markdown(
+                    "- Files are generated on-demand from the current in-memory data (header + goods).\n"
+                    "- If you haven’t extracted/added any goods, the download endpoints will return a small JSON error."
+                )
 
-@app.get("/ecus/download/xml")
-def download_ecus_xml_api():
-    rows = [{**ECUS_HEADER, **g} for g in ECUS_GOODS] or [ECUS_HEADER]
-    xml_text = fill_template(TEMPLATE_XML, rows)
-    path = write_text(xml_text, "declaration.xml")
-    return FileResponse(path, filename="declaration.xml", media_type="application/xml")
+        return demo
 
-@app.get("/ecus/download/csv")
-def download_ecus_csv_api():
-    rows = [{**ECUS_HEADER, **g} for g in ECUS_GOODS]
-    if not rows:
-        return {"error": "No declaration rows"}
-    path = write_csv(rows, fname="declaration.csv")
-    return FileResponse(path, filename="declaration.csv", media_type="text/csv")
+# Mount Gradio AFTER defining the routes (important for downloads)
+ui = build_ecus_ui()
+app = gr.mount_gradio_app(app, ui, path="/")

@@ -1,10 +1,12 @@
-# main_app.py
+import glob
 import os
 import json
 import csv
 import base64
 import tempfile
 from typing import List, Dict, Any
+from datetime import datetime
+import re
 
 import yaml
 import gradio as gr
@@ -24,21 +26,24 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+SAMPLE_DIR = "data"
+SAMPLES = [
+    {
+        "label": os.path.basename(p),
+        "path": p
+    }
+    for p in sorted(glob.glob(os.path.join(SAMPLE_DIR, "*.pdf")))
+]
 
 # --- config / defaults ---
 with open("config.yaml", "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f) or {}
-DEFAULT_FIELDS: List[str] = _cfg.get(
-    "DEFAULT_FIELDS",
-    [
-        "Số phiếu", "Ngày chứng từ(mm/dd/yyyy)", "Ngày xuất(mm/dd/yyyy)",
-        "Mã FG", "Đvt", "Số lượng(Thùng)", "Số lượng(Pcs)",
-        "Kho nhận", "Địa chỉ", "Mã AR"
-    ]
-)
+
+DEFAULT_FIELDS: List[str] = _cfg.get("DEFAULT_FIELDS", [])
+PROMPT_SYSTEM: str = _cfg.get("PROMPT_SYSTEM", "")
 
 # --- utils from your repo ---
-from utils.helpers import build_prompt, clean_json_output, get_fields_from_table  # noqa: E402
+from utils.helpers import clean_json_output, get_fields_from_table  # noqa: E402
 
 # --- in-memory store ---
 MAIN_ROWS: List[Dict[str, Any]] = []
@@ -77,9 +82,71 @@ def write_csv(rows: List[Dict[str, Any]]) -> str:
         w.writerows(rows)
     return path
 
+# --- prompt builder ---
+def _fields_as_bullets(fields: List[str]) -> str:
+    return "\n".join([f"- \"{f}\"" for f in fields])
+
+def _fields_as_json_example(fields: List[str]) -> str:
+    return ",\n".join([f'      "{f}": null' for f in fields])
+
+def _build_prompt(fields: List[str]) -> str:
+    return PROMPT_SYSTEM.format(
+        fields_bullets=_fields_as_bullets(fields),
+        fields_example=_fields_as_json_example(fields),
+    )
+
+# --- normalization rules ---
+DATE_DOC = "Ngày chứng từ(mm/dd/yyyy)"
+DATE_OUT = "Ngày xuất(mm/dd/yyyy)"
+SO_PHIEU = "Số phiếu"
+
+def _parse_mmddyyyy_or_none(s: str) -> str | None:
+    if not s or not str(s).strip():
+        return None
+    s = str(s).strip()
+    s_norm = re.sub(r"[.\- ]", "/", s)
+    candidates = [s_norm]
+
+    if re.fullmatch(r"\d{8}", re.sub(r"[^0-9]", "", s)):
+        digits = re.sub(r"[^0-9]", "", s)
+        candidates.append(f"{digits[0:2]}/{digits[2:4]}/{digits[4:8]}")
+
+    fmts = ["%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%Y/%d/%m"]
+    for cand in candidates:
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(cand, fmt)
+                return dt.strftime("%m/%d/%Y")
+            except Exception:
+                pass
+    return None
+
+def _normalize_rows(rows: List[Dict[str, Any]], fields: List[str]) -> List[Dict[str, Any]]:
+    normalized = []
+    for r in rows:
+        item = {f: (r.get(f, None)) for f in fields}
+
+        # "Số phiếu" → null if missing
+        if not item.get(SO_PHIEU) or str(item.get(SO_PHIEU)).strip() == "":
+            item[SO_PHIEU] = None
+
+        # Normalize dates
+        out_norm = _parse_mmddyyyy_or_none(item.get(DATE_OUT))
+        doc_norm = _parse_mmddyyyy_or_none(item.get(DATE_DOC))
+
+        # Prevent copy: if equal → null Ngày chứng từ
+        if doc_norm and out_norm and doc_norm == out_norm:
+            doc_norm = None
+
+        item[DATE_OUT] = out_norm
+        item[DATE_DOC] = doc_norm
+
+        normalized.append(item)
+    return normalized
+
 # --- extraction ---
 def extract_from_pdf(pdf_path: str, fields: List[str]) -> List[Dict[str, Any]]:
-    prompt = build_prompt(fields)
+    prompt = _build_prompt(fields)
     uploaded = client.files.create(file=open(pdf_path, "rb"), purpose="assistants")
     fid = uploaded.id
     try:
@@ -99,6 +166,9 @@ def extract_from_pdf(pdf_path: str, fields: List[str]) -> List[Dict[str, Any]]:
             data = [data]
         if not isinstance(data, list):
             raise ValueError("Model did not return a list/dict JSON")
+
+        # Apply business rules
+        data = _normalize_rows(data, fields)
         return data
     finally:
         client.files.delete(fid)
@@ -110,7 +180,6 @@ def build_main_ui():
 
         with gr.Row():
             with gr.Column(scale=2):
-                # Force type="filepath"
                 pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"], type="filepath")
                 pdf_preview = gr.HTML(label="Preview PDF")
             with gr.Column(scale=1):
@@ -126,6 +195,29 @@ def build_main_ui():
                 )
 
         pdf_file.upload(show_pdf, inputs=pdf_file, outputs=pdf_preview)
+
+        if SAMPLES:
+            gr.Markdown("### 📄 Or try sample files")
+
+            sample_choices = gr.Dropdown(
+                choices=[s["label"] for s in SAMPLES],
+                label="Select a sample PDF to preview",
+                interactive=True,
+            )
+
+            def load_sample(label):
+                for s in SAMPLES:
+                    if s["label"] == label:
+                        return s["path"], show_pdf(s["path"])
+                return None, ""
+
+            sample_choices.change(
+                load_sample,
+                inputs=[sample_choices],
+                outputs=[pdf_file, pdf_preview],
+            )
+        else:
+            gr.Markdown("_No sample PDFs found in the `data/` folder._")
 
         extract_btn = gr.Button("Extract Info")
         status = gr.Label()
@@ -150,7 +242,11 @@ def build_main_ui():
                 return [], f"⚠️ Extraction failed: {e}"
             if not rows:
                 return [], "⚠️ No entries extracted."
-            grid = [[str(r.get(h, "")) for h in fields] for r in rows]
+
+            def _to_cell(v):
+                return "" if v is None else str(v)
+
+            grid = [[_to_cell(r.get(h, "")) for h in fields] for r in rows]
             return gr.update(value=grid, headers=fields, col_count=(len(fields), "dynamic")), "✅ Extraction successful"
 
         extract_btn.click(do_extract, inputs=[pdf_file, fields_table], outputs=[demo_table, status])
@@ -159,8 +255,6 @@ def build_main_ui():
         session_status = gr.Label()
 
         def add_results(tbl):
-            if not tbl:
-                return "⚠️ Nothing to add"
             headers = tbl.headers if hasattr(tbl, "headers") else DEFAULT_FIELDS
             values = tbl.values.tolist() if hasattr(tbl, "values") else tbl
             added = 0
@@ -175,6 +269,7 @@ def build_main_ui():
         with gr.Row():
             gr.Button("⬇️ Download JSON").click(None, js="() => { window.open('/download/json','_blank') }")
             gr.Button("⬇️ Download CSV").click(None, js="() => { window.open('/download/csv','_blank') }")
+
             def clear_all():
                 MAIN_ROWS.clear()
                 return "Cleared."

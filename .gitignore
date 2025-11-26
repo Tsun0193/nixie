@@ -208,3 +208,5 @@ __marimo__/
 *.zip
 gradio_tmp/
 data/
+hf_cache/
+deepseek_ocr/

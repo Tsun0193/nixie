@@ -5,11 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.12.0",
+    "addict>=2.4.0",
+    "bitsandbytes>=0.48.2",
     "gradio[client]>=5.45.0",
+    "huggingface-hub>=0.34.4",
     "matplotlib>=3.10.6",
     "paddleocr[doc-parser,ie]>=3.2.0",
     "paddlepaddle>=3.2.0",
     "pdf2image>=1.17.0",
+    "pymupdf>=1.26.6",
+    "sentencepiece>=0.2.1",
     "torch>=2.8.0",
     "transformers>=4.56.1",
+    "unsloth>=2025.11.3",
 ]

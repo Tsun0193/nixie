@@ -1,11 +1,12 @@
 import json
 from app.clients.openai_client import get_openai_client
 from app.settings import settings
-from utils.helpers import build_prompt, clean_json_output 
+from utils.helpers import build_prompt, clean_json_output, parse_model_payload 
 
-def extract_from_pdf(file_path: str, fields: list[str]) -> list[dict]:
+def extract_from_pdf(file_path: str, fields: list[str]) -> tuple[list[dict], dict | None, list[dict]]:
     """
-    Calls the LLM with a prompt + file. Returns list of dicts (rows).
+    Calls the LLM with a prompt + file.
+    Returns (merged_rows, metadata_row_or_none, table_rows).
     """
     client = get_openai_client()
     prompt = build_prompt(fields)
@@ -27,11 +28,7 @@ def extract_from_pdf(file_path: str, fields: list[str]) -> list[dict]:
         output = clean_json_output(raw_output)
 
         data = json.loads(output)
-        if isinstance(data, dict):
-            data = [data]
-        if not isinstance(data, list):
-            raise ValueError("Model response is not a list/dict")
-
-        return data
+        merged_rows, metadata_row, table_rows = parse_model_payload(data, fields)
+        return merged_rows, metadata_row, table_rows
     finally:
         client.files.delete(file_id)

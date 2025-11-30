@@ -74,14 +74,14 @@ def _extract_handler(pdf_file, fields_table):
 
     path = pdf_file.name if hasattr(pdf_file, "name") else pdf_file
     try:
-        data = extract_from_pdf(path, fields_list)
+        merged_rows, _, _ = extract_from_pdf(path, fields_list)
     except Exception as e:
         return [], f"⚠️ Extraction failed: {e}"
 
-    if not data:
+    if not merged_rows:
         return [], "⚠️ No entries extracted."
 
-    rows = [[str(entry.get(h, "")) for h in fields_list] for entry in data]
+    rows = [[str(entry.get(h, "")) for h in fields_list] for entry in merged_rows]
     return gr.update(value=rows, headers=fields_list,
                      col_count=(len(fields_list), "dynamic")), "✅ Extraction successful"
 

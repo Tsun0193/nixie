@@ -43,7 +43,7 @@ DEFAULT_FIELDS: List[str] = _cfg.get("DEFAULT_FIELDS", [])
 PROMPT_SYSTEM: str = _cfg.get("PROMPT_SYSTEM", "")
 
 # --- utils from your repo ---
-from utils.helpers import clean_json_output, get_fields_from_table  # noqa: E402
+from utils.helpers import clean_json_output, get_fields_from_table, parse_model_payload  # noqa: E402
 
 # --- in-memory store ---
 MAIN_ROWS: List[Dict[str, Any]] = []
@@ -145,7 +145,7 @@ def _normalize_rows(rows: List[Dict[str, Any]], fields: List[str]) -> List[Dict[
     return normalized
 
 # --- extraction ---
-def extract_from_pdf(pdf_path: str, fields: List[str]) -> List[Dict[str, Any]]:
+def extract_from_pdf(pdf_path: str, fields: List[str]) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, List[Dict[str, Any]]]:
     prompt = _build_prompt(fields)
     uploaded = client.files.create(file=open(pdf_path, "rb"), purpose="assistants")
     fid = uploaded.id
@@ -162,14 +162,11 @@ def extract_from_pdf(pdf_path: str, fields: List[str]) -> List[Dict[str, Any]]:
         )
         raw = resp.output_text.strip()
         data = json.loads(clean_json_output(raw))
-        if isinstance(data, dict):
-            data = [data]
-        if not isinstance(data, list):
-            raise ValueError("Model did not return a list/dict JSON")
+        merged_rows, metadata_row, table_rows = parse_model_payload(data, fields)
 
-        # Apply business rules
-        data = _normalize_rows(data, fields)
-        return data
+        # Apply business rules to merged rows
+        merged_rows = _normalize_rows(merged_rows, fields)
+        return merged_rows, metadata_row, table_rows
     finally:
         client.files.delete(fid)
 
@@ -237,16 +234,16 @@ def build_main_ui():
             fields = get_fields_from_table(table) or [r[0] for r in table if r and r[0]] or DEFAULT_FIELDS
             path = file if isinstance(file, str) else file.name
             try:
-                rows = extract_from_pdf(path, fields)
+                merged_rows, _, _ = extract_from_pdf(path, fields)
             except Exception as e:
                 return [], f"⚠️ Extraction failed: {e}"
-            if not rows:
+            if not merged_rows:
                 return [], "⚠️ No entries extracted."
 
             def _to_cell(v):
                 return "" if v is None else str(v)
 
-            grid = [[_to_cell(r.get(h, "")) for h in fields] for r in rows]
+            grid = [[_to_cell(r.get(h, "")) for h in fields] for r in merged_rows]
             return gr.update(value=grid, headers=fields, col_count=(len(fields), "dynamic")), "✅ Extraction successful"
 
         extract_btn.click(do_extract, inputs=[pdf_file, fields_table], outputs=[demo_table, status])

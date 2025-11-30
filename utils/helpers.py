@@ -1,4 +1,5 @@
 import re
+from typing import Any, Dict, List, Tuple
 import yaml
 
 with open("config.yaml", "r", encoding="utf-8") as f:
@@ -14,14 +15,12 @@ Nhiệm vụ:
 """)
 
 def build_prompt(fields):
-    # Expecting a list of field names; you already used this in your main flow.
-    # This constructs the system/user prompt content.
-    fields_txt = ", ".join([str(f) for f in fields])
-    return f"""{SYSTEM_PROMPT}
-
-Yêu cầu trích xuất các trường sau, trả về JSON hợp lệ (1 hoặc nhiều objects):
-[{fields_txt}]
-"""
+    bullets = "\n".join([f'- "{f}"' for f in fields])
+    example = ",\n".join([f'      "{f}": null' for f in fields])
+    return SYSTEM_PROMPT.format(
+        fields_bullets=bullets,
+        fields_example=example,
+    )
 
 def clean_json_output(text: str) -> str:
     text = text.strip()
@@ -38,6 +37,63 @@ def clean_json_output(text: str) -> str:
     if m: 
         return m.group(0)
     return text
+
+# ---- parsing helpers for metadata + table rows ----
+def _records_from_table_struct(table: Any) -> List[Dict[str, Any]]:
+    if isinstance(table, dict):
+        columns = table.get("columns", [])
+        rows = table.get("rows", [])
+        if columns and rows:
+            return [dict(zip(columns, row)) for row in rows]
+    if isinstance(table, list) and table:
+        columns = table[0]
+        rows = table[1:]
+        if isinstance(columns, list) and rows:
+            return [dict(zip(columns, row)) for row in rows]
+    return []
+
+def split_metadata_and_rows(data: Any) -> Tuple[Dict[str, Any] | None, List[Dict[str, Any]]]:
+    metadata: Dict[str, Any] | None = None
+    rows: List[Dict[str, Any]] = []
+
+    if isinstance(data, dict):
+        metadata_candidate = data.get("metadata") or data.get("header")
+        if isinstance(metadata_candidate, list):
+            metadata_candidate = metadata_candidate[0] if metadata_candidate else None
+        if isinstance(metadata_candidate, dict):
+            metadata = metadata_candidate
+
+        table_candidate = data.get("table_rows") or data.get("table") or data.get("rows")
+        rows = _records_from_table_struct(table_candidate) if table_candidate is not None else []
+        if not rows and isinstance(table_candidate, list) and all(isinstance(r, dict) for r in table_candidate):
+            rows = table_candidate
+
+    elif isinstance(data, list):
+        rows = [r for r in data if isinstance(r, dict)]
+
+    return metadata, rows
+
+def normalize_fields(record: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+    return {field: record.get(field, None) for field in fields}
+
+def merge_metadata_rows(metadata: Dict[str, Any] | None, rows: List[Dict[str, Any]], fields: List[str]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    if rows:
+        for row in rows:
+            merged.append({
+                field: row.get(field) if row.get(field) not in (None, "") else (metadata.get(field) if metadata else None)
+                for field in fields
+            })
+    elif metadata:
+        merged = [metadata]
+    return merged
+
+def parse_model_payload(payload: Any, fields: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any] | None, List[Dict[str, Any]]]:
+    metadata_raw, rows_raw = split_metadata_and_rows(payload)
+    metadata_norm = normalize_fields(metadata_raw, fields) if metadata_raw else None
+    rows_norm = [normalize_fields(r, fields) for r in rows_raw] if rows_raw else []
+    merged = merge_metadata_rows(metadata_norm, rows_norm, fields)
+    return merged, metadata_norm, rows_norm
 
 def get_fields_from_table(df_like):
     """Accepts a Gradio Dataframe value; returns a flat list of field names."""

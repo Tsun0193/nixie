@@ -24,6 +24,7 @@ DEFAULT_FIELDS = CONFIG.get("DEFAULT_FIELDS", [
     "Mã FG", "Đvt", "Số lượng(Thùng)", "Số lượng(Pcs)",
     "Kho nhận", "Địa chỉ", "Mã AR"
 ])
+METADATA_FIELDS = CONFIG.get("METADATA_FIELDS", [])
 
 # Load ECUS template (required)
 with open(settings.template_xml_path, "r", encoding="utf-8") as f:

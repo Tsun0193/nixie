@@ -4,9 +4,9 @@ import json
 import csv
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import List
 
-from utils.helpers import parse_model_payload
+from utils.helpers import parse_model_payload, clean_json_output, METADATA_FIELDS
 
 try:
     import yaml
@@ -18,7 +18,7 @@ model = AutoModelForImageTextToText.from_pretrained(
     "Qwen/Qwen3-VL-8B-Instruct",
     dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",  # fall back to PyTorch SDPA (works without flash-attn / GPU)
-    device_map="cuda:1",  # will place on GPU if visible, else CPU
+    device_map="cuda",  # will place on GPU if visible, else CPU
     cache_dir=".cache"
 )
 model.eval()
@@ -31,13 +31,25 @@ processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f) or {}
 default_fields: List[str] = config.get("DEFAULT_FIELDS", [])
+metadata_fields: List[str] = config.get("METADATA_FIELDS", METADATA_FIELDS)
 
-def build_prompt(template: str, fields: List[str]) -> str:
-    bullets = "\n".join([f'- "{f}"' for f in fields])
-    example = ",\n".join([f'      "{f}": null' for f in fields])
+def build_prompt(template: str, fields: List[str], metadata_fields: List[str]) -> str:
+    def bullets(fs: List[str]) -> str:
+        return "\n".join([f'- "{f}"' for f in fs])
+
+    def example(fs: List[str]) -> str:
+        return ",\n".join([f'      "{f}": null' for f in fs])
+
+    metadata_fs = [f for f in metadata_fields if f in fields]
+    table_fs = [f for f in fields if f not in metadata_fs]
+
     return template.format(
-        fields_bullets=bullets,
-        fields_example=example,
+        fields_bullets=bullets(fields),
+        fields_example=example(fields),
+        metadata_fields_bullets=bullets(metadata_fs),
+        metadata_fields_example=example(metadata_fs),
+        table_fields_bullets=bullets(table_fs),
+        table_fields_example=example(table_fs),
     )
 
 prompt_system = build_prompt(
@@ -49,6 +61,7 @@ prompt_system = build_prompt(
         else "Extract the table from the provided image and parse it into JSON format."
     ),
     default_fields,
+    metadata_fields,
 )
 
 messages = [
@@ -94,39 +107,15 @@ print(output_text)
 raw_text = output_text[0] if output_text else ""
 clean_text = re.sub(r"^```(?:json)?\n?", "", raw_text).rstrip("`").strip()
 
-def extract_json(text: str):
-    """Best-effort JSON extraction from possibly noisy model output."""
-    text = text.strip()
+cleaned = clean_json_output(clean_text)
+try:
+    data = json.loads(cleaned)
+except Exception as exc:
+    raise ValueError(f"Could not parse JSON from model output: {exc}") from exc
 
-    def try_parse(candidate: str):
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-
-    parsed = try_parse(text)
-    if parsed is not None:
-        return parsed
-
-    array_match = re.search(r"\[[\s\S]*?\]", text)
-    if array_match:
-        parsed = try_parse(array_match.group(0))
-        if parsed is not None:
-            return parsed
-
-    objects = []
-    for match in re.finditer(r"\{[^{}]*\}", text):
-        candidate = try_parse(match.group(0))
-        if candidate is not None:
-            objects.append(candidate)
-    if objects:
-        return objects
-
-    raise ValueError("Could not parse JSON from model output")
-
-data = extract_json(clean_text)
-
-merged_records, metadata_norm, rows_norm = parse_model_payload(data, default_fields)
+merged_records, metadata_norm, rows_norm = parse_model_payload(
+    data, default_fields, metadata_fields=metadata_fields
+)
 
 os.makedirs("output", exist_ok=True)
 csv_path = os.path.join("output", "extracted_table.csv")

@@ -1,44 +1,42 @@
 DEFAULT_FIELDS:
-  - "So_phieu"
-  - "Ngay_chung_tu_mmddyyyy"
-  - "Ngay_xuat_mmddyyyy"
-  - "Ma_FG"
-  - "Ten_san_pham"
-  - "Kich_thuoc"
-  - "Ngay_SX"
-  - "DVT"
-  - "So_luong_thung"
-  - "So_luong_pcs"
-  - "Kho_nhan"
-  - "Dia_chi"
-  - "Ma_AR"
+  - "Số phiếu"
+  - "Ngày chứng từ(mm/dd/yyyy)"
+  - "Ngày xuất(mm/dd/yyyy)"
+  - "Mã FG"
+  - "Đvt"
+  - "Số lượng(Thùng)"
+  - "Số lượng(Pcs)"
+  - "Kho nhận"
+  - "Địa chỉ"
+  - "Mã AR"
+
+METADATA_FIELDS:
+  - "Số phiếu"
+  - "Ngày chứng từ(mm/dd/yyyy)"
+  - "Ngày xuất(mm/dd/yyyy)"
+  - "Kho nhận"
+  - "Địa chỉ"
+  - "Mã AR"
 
 PROMPT_SYSTEM: |
   You are an OCR + Supply Chain extraction model.
 
-  Task: return JSON only (no prose) with up to two sections so we can merge later:
-  - "metadata": a single object with front-page header info (null if the page is not a front page).
-  - "table_rows": an array of objects for every line item row detected on the current page (empty array if none).
+  Task: return JSON only (no prose) as TWO JSON blocks (JSON Lines):
+  1) Metadata object: header info only (these fields): {metadata_fields_bullets}. If this page has no header info, emit null.
+  2) Table object: {{ "table_rows": [ ... ] }} where each row uses ONLY the table fields: {table_fields_bullets}. Do not include metadata fields inside rows.
 
-  Use the required fields below for every object and keep keys exactly as written:
-  {fields_bullets}
-
-  Output schema (keep keys; fill values or null):
+  Output format (two lines):
+  <metadata-object-or-null>
   {{
-    "metadata": {{
-      {fields_example}
-    }},
     "table_rows": [
       {{
-        {fields_example}
+        {table_fields_example}
       }}
     ]
   }}
 
   Rules:
+  - Extract ALL rows; do not summarize totals.
   - Dates: convert dd/mm/yyyy → mm/dd/yyyy.
   - If a field is missing or unreadable, set it to null.
-  - Do not duplicate metadata into each table row; leave doc-level fields null in table_rows when they repeat across rows. We will replicate later.
-  - If the page has only table data, set "metadata": null.
-  - If the page has only header info, return metadata and set "table_rows": [].
-  - Return JSON only, no explanation or Markdown.
+  - Do not add extra text, Markdown, or code fences—return pure JSON only.

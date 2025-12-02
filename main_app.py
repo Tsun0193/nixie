@@ -9,30 +9,27 @@ from datetime import datetime
 import re
 
 import yaml
+# --- Gradio temp dir fix (must be set before importing gradio) ---
+os.environ["GRADIO_TEMP_DIR"] = os.path.join(os.getcwd(), "gradio_tmp")
+os.environ["TMPDIR"] = os.environ["GRADIO_TEMP_DIR"]
+os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
+
 import gradio as gr
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
-from openai import OpenAI
+import torch
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
-# --- Gradio temp dir fix ---
-os.environ["GRADIO_TEMP_DIR"] = os.path.join(os.getcwd(), "gradio_tmp")
-os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
-
-# --- load env / client ---
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
-client = OpenAI(api_key=OPENAI_API_KEY)
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
 SAMPLE_DIR = "data"
 SAMPLES = [
     {
         "label": os.path.basename(p),
         "path": p
     }
-    for p in sorted(glob.glob(os.path.join(SAMPLE_DIR, "*.pdf")))
+    for p in sorted(glob.glob(os.path.join(SAMPLE_DIR, "*.png")))
 ]
 
 # --- config / defaults ---
@@ -40,6 +37,7 @@ with open("config.yaml", "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f) or {}
 
 DEFAULT_FIELDS: List[str] = _cfg.get("DEFAULT_FIELDS", [])
+METADATA_FIELDS: List[str] = _cfg.get("METADATA_FIELDS", [])
 PROMPT_SYSTEM: str = _cfg.get("PROMPT_SYSTEM", "")
 
 # --- utils from your repo ---
@@ -48,22 +46,36 @@ from utils.helpers import clean_json_output, get_fields_from_table, parse_model_
 # --- in-memory store ---
 MAIN_ROWS: List[Dict[str, Any]] = []
 
+# --- local model (same stack as draft.py) ---
+_model = AutoModelForImageTextToText.from_pretrained(
+    "Qwen/Qwen3-VL-8B-Instruct",
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    device_map="cuda",
+    cache_dir=".cache",
+)
+_model.eval()
+_processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+
 # --- helpers ---
 def show_pdf(file) -> str:
     if file is None:
         return ""
     path = file.name if hasattr(file, "name") else file
+    ext = os.path.splitext(path)[1].lower()
     with open(path, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode("utf-8")
-    width = 700
-    height = int(width * 1.414)
-    return f'''
-    <embed src="data:application/pdf;base64,{b64}"
-           type="application/pdf"
-           width="{width}px" height="{height}px"
-           style="border:1px solid #ddd; margin:auto; display:block;" />
-    '''
+    if ext == ".pdf":
+        width = 700
+        height = int(width * 1.414)
+        return f'''
+        <embed src="data:application/pdf;base64,{b64}"
+               type="application/pdf"
+               width="{width}px" height="{height}px"
+               style="border:1px solid #ddd; margin:auto; display:block;" />
+        '''
+    return f'<img src="data:image;base64,{b64}" style="max-width:100%; height:auto; display:block; margin:auto;" />'
 
 def write_json(rows: List[Dict[str, Any]]) -> str:
     path = os.path.join(tempfile.gettempdir(), "results.json")
@@ -90,9 +102,15 @@ def _fields_as_json_example(fields: List[str]) -> str:
     return ",\n".join([f'      "{f}": null' for f in fields])
 
 def _build_prompt(fields: List[str]) -> str:
+    metadata_fields = [f for f in METADATA_FIELDS if f in fields]
+    table_fields = [f for f in fields if f not in metadata_fields]
     return PROMPT_SYSTEM.format(
         fields_bullets=_fields_as_bullets(fields),
         fields_example=_fields_as_json_example(fields),
+        metadata_fields_bullets=_fields_as_bullets(metadata_fields),
+        metadata_fields_example=_fields_as_json_example(metadata_fields),
+        table_fields_bullets=_fields_as_bullets(table_fields),
+        table_fields_example=_fields_as_json_example(table_fields),
     )
 
 # --- normalization rules ---
@@ -144,31 +162,47 @@ def _normalize_rows(rows: List[Dict[str, Any]], fields: List[str]) -> List[Dict[
         normalized.append(item)
     return normalized
 
-# --- extraction ---
+# --- extraction (local model, image input) ---
 def extract_from_pdf(pdf_path: str, fields: List[str]) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, List[Dict[str, Any]]]:
     prompt = _build_prompt(fields)
-    uploaded = client.files.create(file=open(pdf_path, "rb"), purpose="assistants")
-    fid = uploaded.id
-    try:
-        resp = client.responses.create(
-            model=MODEL,
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_file", "file_id": fid}
-                ]
-            }]
-        )
-        raw = resp.output_text.strip()
-        data = json.loads(clean_json_output(raw))
-        merged_rows, metadata_row, table_rows = parse_model_payload(data, fields)
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": prompt}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pdf_path},
+                {"type": "text", "text": "Return only the JSON as instructed (no explanations)."},
+            ],
+        },
+    ]
 
-        # Apply business rules to merged rows
-        merged_rows = _normalize_rows(merged_rows, fields)
-        return merged_rows, metadata_row, table_rows
-    finally:
-        client.files.delete(fid)
+    inputs = _processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(_model.device)
+    generated_ids = _model.generate(**inputs, max_new_tokens=1024)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = _processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True
+    )
+
+    raw_text = output_text[0] if output_text else ""
+    raw_text = raw_text.strip()
+    cleaned = clean_json_output(raw_text)
+    data = json.loads(cleaned)
+
+    merged_rows, metadata_row, table_rows = parse_model_payload(data, fields)
+    merged_rows = _normalize_rows(merged_rows, fields)
+    return merged_rows, metadata_row, table_rows
 
 # --- Gradio UI ---
 def build_main_ui():
@@ -177,8 +211,8 @@ def build_main_ui():
 
         with gr.Row():
             with gr.Column(scale=2):
-                pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"], type="filepath")
-                pdf_preview = gr.HTML(label="Preview PDF")
+                pdf_file = gr.File(label="Upload Image/PDF", file_types=[".pdf", ".png", ".jpg", ".jpeg"], type="filepath")
+                pdf_preview = gr.HTML(label="Preview")
             with gr.Column(scale=1):
                 gr.Markdown("### Fields (edit/add/remove)")
                 fields_table = gr.Dataframe(
@@ -227,26 +261,33 @@ def build_main_ui():
             interactive=True,
             label="Extracted Entries (editable)"
         )
+        metadata_view = gr.JSON(label="Metadata (header fields)")
+        table_rows_view = gr.JSON(label="Raw table rows")
 
         def do_extract(file, table):
             if file is None:
-                return [], "⚠️ No file uploaded"
+                return [], {}, [], "⚠️ No file uploaded"
             fields = get_fields_from_table(table) or [r[0] for r in table if r and r[0]] or DEFAULT_FIELDS
             path = file if isinstance(file, str) else file.name
             try:
-                merged_rows, _, _ = extract_from_pdf(path, fields)
+                merged_rows, metadata_row, table_rows = extract_from_pdf(path, fields)
             except Exception as e:
-                return [], f"⚠️ Extraction failed: {e}"
+                return [], {}, [], f"⚠️ Extraction failed: {e}"
             if not merged_rows:
-                return [], "⚠️ No entries extracted."
+                return [], {}, [], "⚠️ No entries extracted."
 
             def _to_cell(v):
                 return "" if v is None else str(v)
 
             grid = [[_to_cell(r.get(h, "")) for h in fields] for r in merged_rows]
-            return gr.update(value=grid, headers=fields, col_count=(len(fields), "dynamic")), "✅ Extraction successful"
+            return (
+                gr.update(value=grid, headers=fields, col_count=(len(fields), "dynamic")),
+                metadata_row or {},
+                table_rows or [],
+                "✅ Extraction successful"
+            )
 
-        extract_btn.click(do_extract, inputs=[pdf_file, fields_table], outputs=[demo_table, status])
+        extract_btn.click(do_extract, inputs=[pdf_file, fields_table], outputs=[demo_table, metadata_view, table_rows_view, status])
 
         add_btn = gr.Button("Add to Results")
         session_status = gr.Label()

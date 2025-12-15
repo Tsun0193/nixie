@@ -4,8 +4,9 @@ import json
 import csv
 import base64
 import tempfile
-from typing import List, Dict, Any
+import subprocess
 from datetime import datetime
+from typing import List, Dict, Any
 import re
 
 import yaml
@@ -24,13 +25,16 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 load_dotenv()
 
 SAMPLE_DIR = "data"
+# Allow both PDFs and common image formats as samples
+_sample_patterns = ["*.pdf", "*.png", "*.jpg", "*.jpeg"]
 SAMPLES = [
-    {
-        "label": os.path.basename(p),
-        "path": p
-    }
-    for p in sorted(glob.glob(os.path.join(SAMPLE_DIR, "*.png")))
+    {"label": os.path.basename(p), "path": p}
+    for p in sorted(
+        {path for pattern in _sample_patterns for path in glob.glob(os.path.join(SAMPLE_DIR, pattern))}
+    )
 ]
+LOG_DIR = "log"
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # --- config / defaults ---
 with open("config.yaml", "r", encoding="utf-8") as f:
@@ -113,6 +117,60 @@ def _build_prompt(fields: List[str]) -> str:
         table_fields_example=_fields_as_json_example(table_fields),
     )
 
+# --- pdf helpers ---
+def _pdf_to_image(pdf_path: str) -> str:
+    """Convert the first page of a PDF to a temporary PNG."""
+    tmp_dir = tempfile.mkdtemp(prefix="pdf_preview_")
+    out_prefix = os.path.join(tmp_dir, "page")
+    cmd = [
+        "pdftoppm",
+        "-png",
+        "-singlefile",
+        "-f",
+        "1",
+        "-l",
+        "1",
+        pdf_path,
+        out_prefix,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("pdftoppm is required to process PDF files") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", "ignore") if exc.stderr else str(exc)
+        raise RuntimeError(f"Failed to convert PDF: {stderr}") from exc
+    return f"{out_prefix}.png"
+
+def _log_model_output(raw_text: str, cleaned_text: str) -> str:
+    """Persist raw/cleaned model output for debugging."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(LOG_DIR, f"model_output_{ts}.json")
+    payload = {
+        "timestamp": ts,
+        "raw": raw_text,
+        "cleaned": cleaned_text,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Do not block extraction flow on logging issues
+        return ""
+    return path
+
+def _autoclose_json(text: str) -> str:
+    """Best-effort fix: balance brackets/braces and strip trailing commas."""
+    fixed = re.sub(r",\s*([\]}])", r"\1", text.strip())
+    def _balance(s: str, open_ch: str, close_ch: str) -> str:
+        diff = s.count(open_ch) - s.count(close_ch)
+        if diff > 0:
+            s += close_ch * diff
+        return s
+    fixed = _balance(fixed, "{", "}")
+    fixed = _balance(fixed, "[", "]")
+    return fixed
+
 # --- normalization rules ---
 DATE_DOC = "Ngày chứng từ(mm/dd/yyyy)"
 DATE_OUT = "Ngày xuất(mm/dd/yyyy)"
@@ -164,6 +222,8 @@ def _normalize_rows(rows: List[Dict[str, Any]], fields: List[str]) -> List[Dict[
 
 # --- extraction (local model, image input) ---
 def extract_from_pdf(pdf_path: str, fields: List[str]) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, List[Dict[str, Any]]]:
+    ext = os.path.splitext(pdf_path)[1].lower()
+    img_path = _pdf_to_image(pdf_path) if ext == ".pdf" else pdf_path
     prompt = _build_prompt(fields)
     messages = [
         {
@@ -173,7 +233,7 @@ def extract_from_pdf(pdf_path: str, fields: List[str]) -> tuple[List[Dict[str, A
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": pdf_path},
+                {"type": "image", "image": img_path},
                 {"type": "text", "text": "Return only the JSON as instructed (no explanations)."},
             ],
         },
@@ -198,7 +258,24 @@ def extract_from_pdf(pdf_path: str, fields: List[str]) -> tuple[List[Dict[str, A
     raw_text = output_text[0] if output_text else ""
     raw_text = raw_text.strip()
     cleaned = clean_json_output(raw_text)
-    data = json.loads(cleaned)
+    log_path = _log_model_output(raw_text, cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Fallback to YAML parser for slightly malformed JSON (e.g., trailing commas)
+        try:
+            data = yaml.safe_load(cleaned)
+        except Exception:
+            # Final attempt: auto-close brackets/braces
+            fixed = _autoclose_json(cleaned)
+            try:
+                data = json.loads(fixed)
+            except Exception as e2:
+                snippet = fixed[:400].replace("\n", " ")
+                raise ValueError(
+                    f"Failed to parse model output as JSON/YAML after auto-fix. Error: {e2}. "
+                    f"Snippet: {snippet}. Log: {log_path or 'n/a'}"
+                ) from e2
 
     merged_rows, metadata_row, table_rows = parse_model_payload(data, fields)
     merged_rows = _normalize_rows(merged_rows, fields)
@@ -232,7 +309,7 @@ def build_main_ui():
 
             sample_choices = gr.Dropdown(
                 choices=[s["label"] for s in SAMPLES],
-                label="Select a sample PDF to preview",
+                label="Select a sample file to preview",
                 interactive=True,
             )
 
@@ -248,7 +325,7 @@ def build_main_ui():
                 outputs=[pdf_file, pdf_preview],
             )
         else:
-            gr.Markdown("_No sample PDFs found in the `data/` folder._")
+            gr.Markdown("_No sample images or PDFs found in the `data/` folder._")
 
         extract_btn = gr.Button("Extract Info")
         status = gr.Label()

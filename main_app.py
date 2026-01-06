@@ -51,15 +51,32 @@ from utils.helpers import clean_json_output, get_fields_from_table, parse_model_
 MAIN_ROWS: List[Dict[str, Any]] = []
 
 # --- local model (same stack as draft.py) ---
+# Env-tunable so we can demo different Qwen variants / hardware easily.
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3-VL-8B-Instruct")
+_DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+QWEN_DEVICE_MAP = os.getenv("QWEN_DEVICE_MAP", _DEFAULT_DEVICE)
+
+def _parse_dtype(val: str | None):
+    key = (val or "").lower()
+    if key in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if key in {"float16", "fp16"}:
+        return torch.float16
+    if key in {"float32", "fp32"}:
+        return torch.float32
+    return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+QWEN_DTYPE = _parse_dtype(os.getenv("QWEN_DTYPE", "bfloat16"))
+
 _model = AutoModelForImageTextToText.from_pretrained(
-    "Qwen/Qwen3-VL-8B-Instruct",
-    dtype=torch.bfloat16,
+    QWEN_MODEL_ID,
+    dtype=QWEN_DTYPE,
     attn_implementation="flash_attention_2",
-    device_map="cuda",
+    device_map=QWEN_DEVICE_MAP,
     cache_dir=".cache",
 )
 _model.eval()
-_processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+_processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID)
 
 # --- helpers ---
 def show_pdf(file) -> str:
